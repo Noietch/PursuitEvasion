@@ -1,0 +1,17 @@
+# Ignore everything
+*
+
+# Allow .py and .json files
+!*.py
+!*.json
+
+# Allow .gitignore itself
+!.gitignore
+
+# Allow directories (needed for git to traverse subdirectories)
+!*/
+
+# But still ignore these directories
+__pycache__/
+policy/
+.claude/
