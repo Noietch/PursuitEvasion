@@ -13,5 +13,4 @@
 
 # But still ignore these directories
 __pycache__/
-policy/
 .claude/
