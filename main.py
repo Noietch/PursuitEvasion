@@ -109,9 +109,9 @@ def main():
                         help='Number of episodes to run')
     parser.add_argument('--max-steps', type=int, default=10000000,
                         help='Maximum steps per episode')
-    parser.add_argument('--env-config', type=str, default='env.json',
+    parser.add_argument('--env-config', type=str, default='configs/env.json',
                         help='Path to environment config')
-    parser.add_argument('--swarm-config', type=str, default='swarm.json',
+    parser.add_argument('--swarm-config', type=str, default='configs/swarm.json',
                         help='Path to swarm config')
 
     args = parser.parse_args()

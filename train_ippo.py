@@ -263,8 +263,8 @@ def main():
     parser = argparse.ArgumentParser(description='Train IPPO on Pursuit-Evasion')
 
     # Environment
-    parser.add_argument('--env-config', type=str, default='env.json')
-    parser.add_argument('--swarm-config', type=str, default='swarm.json')
+    parser.add_argument('--env-config', type=str, default='configs/env.json')
+    parser.add_argument('--swarm-config', type=str, default='configs/swarm.json')
     parser.add_argument('--max-steps', type=int, default=1000)
 
     # Training

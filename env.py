@@ -34,8 +34,8 @@ class PursuitEvasionEnv:
 
     def __init__(
         self,
-        env_config_path: str = 'env.json',
-        swarm_config_path: str = 'swarm.json',
+        env_config_path: str = 'configs/env.json',
+        swarm_config_path: str = 'configs/swarm.json',
         state_port: int = 5555,
         cmd_port: int = 5556,
         max_steps: int = 1000

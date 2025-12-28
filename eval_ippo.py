@@ -71,8 +71,8 @@ def evaluate(env, policy, num_episodes=10, verbose=True):
 def main():
     parser = argparse.ArgumentParser(description='Evaluate IPPO on Pursuit-Evasion')
     parser.add_argument('--model', type=str, required=True, help='Path to model checkpoint')
-    parser.add_argument('--env-config', type=str, default='env.json')
-    parser.add_argument('--swarm-config', type=str, default='swarm.json')
+    parser.add_argument('--env-config', type=str, default='configs/env.json')
+    parser.add_argument('--swarm-config', type=str, default='configs/swarm.json')
     parser.add_argument('--episodes', type=int, default=10)
     parser.add_argument('--max-steps', type=int, default=1000)
     parser.add_argument('--cuda', action='store_true')
