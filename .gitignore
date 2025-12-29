@@ -14,3 +14,4 @@
 # But still ignore these directories
 __pycache__/
 .claude/
+trash/*

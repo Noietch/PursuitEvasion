@@ -7,6 +7,9 @@ import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import os
+from datetime import datetime
+from tqdm import tqdm
 from typing import Dict, List, Tuple, Optional
 from .base_policy import BasePolicy
 
@@ -213,21 +216,24 @@ class IPPOPolicy(BasePolicy):
         self,
         num_evaders: int = 10,
         num_pursuers: int = 10,
+        num_obstacles: int = 10,
         max_vel: float = 4.0,
         hidden_dim: int = 128,
         device: str = 'cpu'
     ):
         super().__init__(num_evaders, max_vel)
         self.num_pursuers = num_pursuers
+        self.num_obstacles = num_obstacles
         self.device = device
 
         # State dim for each evader's local observation:
         # - relative position to target (2)
         # - distances to all pursuers (num_pursuers)
         # - directions to k nearest pursuers (k * 2)
+        # - distances to all obstacles (num_obstacles)
         # - own status (captured, winning) (2)
         self.k_nearest = min(3, num_pursuers)
-        self.state_dim = 2 + num_pursuers + self.k_nearest * 2 + 2
+        self.state_dim = 2 + num_pursuers + self.k_nearest * 2 + num_obstacles + 2
         self.action_dim = 2  # velocity (vx, vy)
 
         self.agent = PPOAgent(
@@ -251,6 +257,7 @@ class IPPOPolicy(BasePolicy):
         evader_pos = observation['evaders_pos'][evader_idx]
         pursuers_pos = observation['pursuers_pos']
         target_center = observation['target_center']
+        obstacle_centers = observation['obstacle_centers']
         captured = observation['evaders_captured'][evader_idx]
         winning = observation['evaders_winning'][evader_idx]
 
@@ -270,6 +277,9 @@ class IPPOPolicy(BasePolicy):
                 direction = direction / dist
             nearest_dirs.extend(direction.tolist())
 
+        # Distances to all obstacles (normalized)
+        obs_distances = np.linalg.norm(obstacle_centers - evader_pos, axis=1) / 1000.0
+
         # Status
         status = [float(captured), float(winning)]
 
@@ -277,6 +287,7 @@ class IPPOPolicy(BasePolicy):
             rel_target,
             distances,
             np.array(nearest_dirs),
+            obs_distances,
             np.array(status)
         ]).astype(np.float32)
 
@@ -383,3 +394,166 @@ class IPPOPolicy(BasePolicy):
     def load(self, path: str):
         """Load policy weights."""
         self.agent.load(path)
+
+    def train(self, env, args, save_dir: str):
+        """
+        Train the IPPO policy.
+
+        Args:
+            env: PursuitEvasionEnv instance
+            args: Training arguments namespace with:
+                - num_iterations, episodes_per_iter, max_steps
+                - update_epochs, batch_size
+                - gamma, lmbda, eps_clip
+                - save_interval, load_model
+            save_dir: Directory to save models
+        """
+        np.random.seed(getattr(args, 'seed', 42))
+        torch.manual_seed(getattr(args, 'seed', 42))
+
+        self.agent.gamma = args.gamma
+        self.agent.lmbda = args.lmbda
+        self.agent.eps_clip = args.eps_clip
+
+        if args.load_model:
+            print(f"Loading model from {args.load_model}")
+            self.load(args.load_model)
+
+        all_rewards = []
+        win_rates = []
+        best_win_rate = 0.0
+
+        for iteration in range(args.num_iterations):
+            iteration_rewards = []
+            iteration_wins = []
+            all_trajectories = []
+
+            desc = f"Iteration {iteration + 1}/{args.num_iterations}"
+            pbar = tqdm(range(args.episodes_per_iter), desc=desc)
+
+            for ep in pbar:
+                trajectories, stats = self._collect_episode(env, args.max_steps)
+
+                iteration_rewards.append(stats['total_reward'])
+                iteration_wins.append(1 if stats['result'] == 'win' else 0)
+
+                for traj in trajectories:
+                    if 'advantages' in traj:
+                        all_trajectories.append(traj)
+
+                if len(iteration_rewards) > 0:
+                    avg_reward = np.mean(iteration_rewards[-min(10, len(iteration_rewards)):])
+                    avg_win = np.mean(iteration_wins[-min(10, len(iteration_wins)):])
+                    pbar.set_postfix({'reward': f'{avg_reward:.1f}', 'win_rate': f'{avg_win:.2f}'})
+
+            if len(all_trajectories) > 0:
+                self.update(all_trajectories, epochs=args.update_epochs, batch_size=args.batch_size)
+
+            mean_reward = np.mean(iteration_rewards)
+            win_rate = np.mean(iteration_wins)
+            all_rewards.extend(iteration_rewards)
+            win_rates.append(win_rate)
+
+            print(f"\nIteration {iteration + 1} Summary:")
+            print(f"  Mean Reward: {mean_reward:.2f}")
+            print(f"  Win Rate: {win_rate * 100:.1f}%")
+            print(f"  Total Episodes: {(iteration + 1) * args.episodes_per_iter}")
+
+            if win_rate > best_win_rate:
+                best_win_rate = win_rate
+                self.save(os.path.join(save_dir, "best_model.pt"))
+                print(f"  New best model saved! Win rate: {win_rate * 100:.1f}%")
+
+            if (iteration + 1) % args.save_interval == 0:
+                self.save(os.path.join(save_dir, f"model_iter_{iteration + 1}.pt"))
+
+        self.save(os.path.join(save_dir, "final_model.pt"))
+        log_path = os.path.join(save_dir, "training_log.npz")
+        np.savez(log_path, rewards=all_rewards, win_rates=win_rates)
+        print(f"Training complete. Models saved to {save_dir}")
+
+    def _collect_episode(self, env, max_steps: int = 1000):
+        """Collect a single episode trajectory."""
+        obs, info = env.reset()
+        self.reset()
+
+        trajectories = [{
+            'states': [], 'actions': [], 'log_probs': [],
+            'rewards': [], 'values': [], 'dones': []
+        } for _ in range(self.num_evaders)]
+
+        episode_reward = 0.0
+        episode_steps = 0
+        terminated = False
+        truncated = False
+
+        while not terminated and not truncated and episode_steps < max_steps:
+            action, log_probs, local_obs_list = self.get_action_with_log_prob(obs)
+            values = self.get_values(obs)
+
+            next_obs, reward, terminated, truncated, info = env.step(action)
+            evader_rewards = self._calculate_individual_rewards(obs, next_obs, reward)
+
+            for i in range(self.num_evaders):
+                captured = obs['evaders_captured'][i]
+                winning = obs['evaders_winning'][i]
+
+                if not (captured or winning):
+                    trajectories[i]['states'].append(local_obs_list[i])
+                    trajectories[i]['actions'].append(action[i] / self.max_vel)
+                    trajectories[i]['log_probs'].append(log_probs[i])
+                    trajectories[i]['rewards'].append(evader_rewards[i])
+                    trajectories[i]['values'].append(values[i])
+                    trajectories[i]['dones'].append(terminated or truncated)
+
+            obs = next_obs
+            episode_reward += reward
+            episode_steps += 1
+
+        final_values = self.get_values(obs)
+        for i in range(self.num_evaders):
+            if len(trajectories[i]['rewards']) > 0:
+                advantages, returns = self.agent.compute_gae(
+                    trajectories[i]['rewards'],
+                    trajectories[i]['values'],
+                    final_values[i],
+                    trajectories[i]['dones']
+                )
+                trajectories[i]['advantages'] = advantages
+                trajectories[i]['returns'] = returns
+
+        stats = {
+            'total_reward': episode_reward,
+            'total_steps': episode_steps,
+            'result': info.get('result', 'unknown'),
+            'evaders_winning': info.get('evaders_winning', 0),
+            'evaders_captured': info.get('evaders_captured', 0)
+        }
+
+        return trajectories, stats
+
+    def _calculate_individual_rewards(self, obs, next_obs, global_reward):
+        """Calculate individual rewards for each evader."""
+        rewards = np.zeros(self.num_evaders)
+        target = obs['target_center']
+
+        for i in range(self.num_evaders):
+            prev_captured = obs['evaders_captured'][i]
+            prev_winning = obs['evaders_winning'][i]
+            curr_captured = next_obs['evaders_captured'][i]
+            curr_winning = next_obs['evaders_winning'][i]
+
+            if prev_captured or prev_winning:
+                continue
+
+            prev_dist = np.linalg.norm(obs['evaders_pos'][i] - target)
+            curr_dist = np.linalg.norm(next_obs['evaders_pos'][i] - target)
+            rewards[i] += 0.1 * (prev_dist - curr_dist)
+
+            if curr_winning and not prev_winning:
+                rewards[i] += 10.0
+            if curr_captured and not prev_captured:
+                rewards[i] -= 5.0
+            rewards[i] -= 0.01
+
+        return rewards

@@ -1,20 +1,21 @@
 """
-Evaluation script for trained IPPO models.
+Unified evaluation script for pursuit-evasion environment.
+Supports all registered policies.
 """
 
 import numpy as np
 import argparse
-import time
 from env import PursuitEvasionEnv
-from policy.ippo_policy import IPPOPolicy
+from policy import POLICY_REGISTRY, create_policy, is_trainable
 
 
 def evaluate(env, policy, num_episodes=10, verbose=True):
     """
-    Evaluate trained policy.
+    Evaluate policy over multiple episodes.
 
     Returns:
-        stats: Aggregated statistics
+        aggregated: Aggregated statistics
+        all_stats: List of per-episode statistics
     """
     all_stats = []
 
@@ -52,10 +53,7 @@ def evaluate(env, policy, num_episodes=10, verbose=True):
             print(f"  Result: {stats['result']}")
             print(f"  Reward: {stats['total_reward']:.2f}")
             print(f"  Steps: {stats['total_steps']}")
-            print(f"  Winning: {stats['evaders_winning']}")
-            print(f"  Captured: {stats['evaders_captured']}")
 
-    # Aggregate
     aggregated = {
         'mean_reward': np.mean([s['total_reward'] for s in all_stats]),
         'std_reward': np.std([s['total_reward'] for s in all_stats]),
@@ -69,39 +67,46 @@ def evaluate(env, policy, num_episodes=10, verbose=True):
 
 
 def main():
-    parser = argparse.ArgumentParser(description='Evaluate IPPO on Pursuit-Evasion')
-    parser.add_argument('--model', type=str, required=True, help='Path to model checkpoint')
+    parser = argparse.ArgumentParser(description='Evaluate policy on Pursuit-Evasion')
+    parser.add_argument('--policy', type=str, default='rush',
+                        choices=list(POLICY_REGISTRY.keys()),
+                        help='Policy to evaluate')
+    parser.add_argument('--model', type=str, default=None,
+                        help='Path to model checkpoint (required for trainable policies)')
     parser.add_argument('--env-config', type=str, default='configs/env.json')
     parser.add_argument('--swarm-config', type=str, default='configs/swarm.json')
     parser.add_argument('--episodes', type=int, default=10)
     parser.add_argument('--max-steps', type=int, default=1000)
+    parser.add_argument('--hidden-dim', type=int, default=128)
     parser.add_argument('--cuda', action='store_true')
     args = parser.parse_args()
 
     device = 'cuda' if args.cuda else 'cpu'
 
     print("=" * 60)
-    print("IPPO Evaluation")
+    print("Pursuit-Evasion Evaluation")
     print("=" * 60)
-    print(f"Model: {args.model}")
+    print(f"Policy: {args.policy}")
     print(f"Episodes: {args.episodes}")
+    if args.model:
+        print(f"Model: {args.model}")
     print("=" * 60)
 
-    # Initialize
     env = PursuitEvasionEnv(
         env_config_path=args.env_config,
         swarm_config_path=args.swarm_config,
         max_steps=args.max_steps
     )
+    print(f"Num evaders: {env.num_evaders}, Num pursuers: {env.num_pursuers}")
 
-    policy = IPPOPolicy(
-        num_evaders=env.num_evaders,
-        num_pursuers=env.num_pursuers,
-        max_vel=env.max_evader_vel,
-        device=device
-    )
-    policy.load(args.model)
-    print("Model loaded successfully!")
+    policy = create_policy(args.policy, env, device=device, hidden_dim=args.hidden_dim)
+
+    if is_trainable(args.policy):
+        if args.model is None:
+            print(f"Warning: {args.policy} is trainable but no --model specified. Using untrained policy.")
+        else:
+            policy.load(args.model)
+            print("Model loaded successfully!")
 
     print("\n(Make sure main_pyqt.exe simulator is running!)")
     print("-" * 60)
@@ -122,6 +127,9 @@ def main():
     except TimeoutError as e:
         print(f"\nError: {e}")
         print("Make sure the simulator (main_pyqt.exe) is running!")
+
+    except KeyboardInterrupt:
+        print("\n\nInterrupted by user.")
 
     finally:
         env.close()

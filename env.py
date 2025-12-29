@@ -25,7 +25,7 @@ class PursuitEvasionEnv:
         - evaders_winning: (num_evaders,) boolean array
         - evaders_captured: (num_evaders,) boolean array
         - target_center: (2,) target area center
-        - obstacles: (num_obstacles, 3, 2) obstacle vertices (triangles)
+        - obstacle_centers: (num_obstacles, 2) obstacle center positions
 
     Action Space:
         Shape (num_evaders, 2), range [-max_vel, max_vel]
@@ -66,9 +66,10 @@ class PursuitEvasionEnv:
         target_vertices = np.array(self.env_config['target'])
         self.target_center = np.mean(target_vertices, axis=0).astype(np.float32)
 
-        # Load obstacles (static, from config)
-        self.obstacles = np.array(self.env_config['obs'], dtype=np.float32)
-        self.num_obstacles = len(self.obstacles)
+        # Load obstacles and compute centers (static, from config)
+        obs_vertices = np.array(self.env_config['obs'], dtype=np.float32)
+        self.obstacle_centers = np.mean(obs_vertices, axis=1)  # (num_obstacles, 2)
+        self.num_obstacles = len(self.obstacle_centers)
 
         # Define action space info (for reference)
         self.action_shape = (self.num_evaders, 2)
@@ -77,7 +78,7 @@ class PursuitEvasionEnv:
 
         # Define observation space info (for reference)
         self.observation_keys = ['evaders_pos', 'pursuers_pos', 'evaders_winning',
-                                  'evaders_captured', 'target_center', 'obstacles']
+                                  'evaders_captured', 'target_center', 'obstacle_centers']
 
         # Initialize ZMQ communication
         self.context = zmq.Context()
@@ -172,7 +173,7 @@ class PursuitEvasionEnv:
             'evaders_winning': np.array(state['evaders_winning'], dtype=np.int8),
             'evaders_captured': np.array(state['evaders_captured'], dtype=np.int8),
             'target_center': self.target_center.copy(),
-            'obstacles': self.obstacles.copy()
+            'obstacle_centers': self.obstacle_centers.copy()
         }
 
     def _calculate_reward(self, state: Dict, prev_state: Optional[Dict]) -> float:
@@ -180,9 +181,11 @@ class PursuitEvasionEnv:
         Calculate reward based on state transition.
 
         Reward structure:
-        - +10 for each evader reaching target (newly winning)
-        - -5 for each evader captured (newly captured)
-        - +0.01 * progress toward target
+        - +20 for each evader reaching target (newly winning)
+        - -20 for each evader captured (newly captured)
+        - +0.1 * progress toward target (for active evaders)
+        - Penalty for being too close to pursuers
+        - Small time penalty per active evader
 
         Args:
             state: Current state
@@ -196,29 +199,52 @@ class PursuitEvasionEnv:
 
         reward = 0.0
 
-        # Reward for newly winning evaders
-        prev_winning = np.array(prev_state['evaders_winning'])
-        curr_winning = np.array(state['evaders_winning'])
-        new_wins = np.sum(curr_winning.astype(int) - prev_winning.astype(int) > 0)
-        reward += new_wins * 10.0
-
-        # Penalty for newly captured evaders
-        prev_captured = np.array(prev_state['evaders_captured'])
-        curr_captured = np.array(state['evaders_captured'])
-        new_captured = np.sum(curr_captured.astype(int) - prev_captured.astype(int) > 0)
-        reward -= new_captured * 5.0
-
-        # Progress reward: distance to target
-        prev_pos = np.array(prev_state['evaders_pos'])
         curr_pos = np.array(state['evaders_pos'])
-        prev_dist = np.linalg.norm(prev_pos - self.target_center, axis=1)
-        curr_dist = np.linalg.norm(curr_pos - self.target_center, axis=1)
+        prev_pos = np.array(prev_state['evaders_pos'])
+        pursuers_pos = np.array(state['pursuers_pos'])
+        curr_captured = np.array(state['evaders_captured']).astype(bool)
+        curr_winning = np.array(state['evaders_winning']).astype(bool)
+        prev_captured = np.array(prev_state['evaders_captured']).astype(bool)
+        prev_winning = np.array(prev_state['evaders_winning']).astype(bool)
 
-        # Only count active evaders
-        active_mask = ~(curr_captured.astype(bool) | curr_winning.astype(bool))
+        active_mask = ~(curr_captured | curr_winning)
+
+        # 1. Terminal rewards (balanced)
+        new_wins = np.sum(curr_winning & ~prev_winning)
+        new_captured = np.sum(curr_captured & ~prev_captured)
+        reward += new_wins * 20.0
+        reward -= new_captured * 20.0
+
+        # 2. Progress reward toward target
         if np.any(active_mask):
+            prev_dist = np.linalg.norm(prev_pos - self.target_center, axis=1)
+            curr_dist = np.linalg.norm(curr_pos - self.target_center, axis=1)
             progress = prev_dist[active_mask] - curr_dist[active_mask]
-            reward += 0.01 * np.sum(progress)
+            reward += 0.1 * np.sum(progress)
+
+        # 3. Pursuer avoidance penalty
+        if np.any(active_mask):
+            danger_threshold = 50.0
+            for i in np.where(active_mask)[0]:
+                evader_pos = curr_pos[i]
+                dists_to_pursuers = np.linalg.norm(pursuers_pos - evader_pos, axis=1)
+                min_dist = np.min(dists_to_pursuers)
+                if min_dist < danger_threshold:
+                    reward -= 0.05 * (danger_threshold - min_dist)
+
+        # 4. Obstacle proximity penalty (small)
+        if np.any(active_mask):
+            obstacle_threshold = 30.0
+            for i in np.where(active_mask)[0]:
+                evader_pos = curr_pos[i]
+                dists_to_obstacles = np.linalg.norm(self.obstacle_centers - evader_pos, axis=1)
+                min_obs_dist = np.min(dists_to_obstacles)
+                if min_obs_dist < obstacle_threshold:
+                    reward -= 0.02 * (obstacle_threshold - min_obs_dist)
+
+        # 5. Small time penalty
+        num_active = np.sum(active_mask)
+        reward -= 0.01 * num_active
 
         return reward
 
